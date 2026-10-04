@@ -2,9 +2,11 @@
 
 <div align="center">
 
-# firefly-deobf
+# Firefly-deobf
 
 **Static deobfuscator for Lua and Luau scripts protected with Firefly.**
+
+Made by **Melodieshusband**
 
 ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
@@ -42,7 +44,7 @@ Lua.
 > [`tests/stress/`](tests/stress) has therefore never been run through the
 > obfuscator.
 >
-> I did everything I could with the material I had. Bugs on inputs outside the
+> I (Melodieshusband) did everything I could with the material I had. Bugs on inputs outside the
 > four samples are expected, and anyone who can produce protected files is
 > welcome to continue from here.
 
@@ -64,7 +66,7 @@ trusting it.
 Requires Python 3.8 or newer.
 
 ```bash
-git clone <this repository>
+git clone https://github.com/Melodieshusband/firefly-deobf.git
 cd firefly-deobf
 python -m firefly_deobf samples/static_protected.lua
 ```
@@ -261,5 +263,7 @@ This tool is meant for analysing scripts that you own or are authorised to
 analyse.
 
 ## License
+
+Copyright 2026 Melodieshusband.
 
 Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).
