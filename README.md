@@ -64,7 +64,7 @@ trusting it.
 Requires Python 3.8 or newer.
 
 ```bash
-git clone https://github.com/Melodieshusband/firefly-deobf.git
+git clone https://github.com/Melodieshusband/FireFly-Protector-Deobfuscator.git
 cd firefly-deobf
 python -m firefly_deobf samples/static_protected.lua
 ```
