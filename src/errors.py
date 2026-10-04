@@ -1,0 +1,2 @@
+class BlockFail(Exception):
+    pass
