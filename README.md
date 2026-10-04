@@ -1,12 +1,10 @@
-# Created by Melodieshusband (Meloten)
-
 <div align="center">
 
 # Firefly-deobf
 
 **Static deobfuscator for Lua and Luau scripts protected with Firefly.**
 
-Made by **Melodieshusband**
+Made by **Melodieshusband (Meloten)**
 
 ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
