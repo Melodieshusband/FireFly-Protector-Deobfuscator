@@ -130,16 +130,28 @@ def stream_decrypt(data, p):
     return out
 
 
-def crc16(data):
-    x = 0xFFFF ^ 0x152E
+def crc16(data, init=0xFFFF ^ 0x152E, poly=0xA001):
+    x = init
     for b in data:
         x ^= b
         for _ in range(8):
             if x & 1:
-                x = (x >> 1) ^ 0xA001
+                x = (x >> 1) ^ poly
             else:
                 x >>= 1
     return x
+
+
+def crc_params(src):
+    init = 0xFFFF ^ 0x152E
+    poly = 0xA001
+    m = re.search(r"(?<![\w.])\w+\(65535,(\d+)\)", src)
+    if m is not None:
+        init = 65535 ^ int(m.group(1))
+    m = re.search(r"(?<![\w.])\w+\(\w+\(\w+/2\),(\d+)\)", src)
+    if m is not None:
+        poly = int(m.group(1))
+    return init, poly
 
 
 def lz_decompress(src, size):
@@ -217,6 +229,120 @@ def parse_records(buf, rotation):
     return records
 
 
+HEADER_START = re.compile(r"=\(function\(\)(?=local\s)")
+LOCAL_DECL = re.compile(r"local\s+(\w+(?:\s*,\s*\w+)*)\s*=\s*")
+HEADER_NUM = re.compile(r"\d+")
+HEADER_SUM = re.compile(r"(\w+)\s*\+\s*(\w+)")
+HEADER_NAME = re.compile(r"[A-Za-z_]\w*")
+
+
+def read_header_chain(src, pos):
+    env = {}
+    flat = []
+    i = pos
+    n = len(src)
+    while True:
+        m = LOCAL_DECL.match(src, i)
+        if m is None:
+            break
+        names = [x.strip() for x in m.group(1).split(",")]
+        j = m.end()
+        vals = []
+        ok = True
+        while True:
+            if j < n and src[j] in "\"'":
+                try:
+                    text, j2 = read_lua_string(src, j)
+                except IndexError:
+                    ok = False
+                    break
+                vals.append(text.decode("latin-1"))
+                j = j2
+            else:
+                mm = HEADER_NUM.match(src, j)
+                if mm is not None and not (mm.end() < n and (src[mm.end()].isalpha() or src[mm.end()] == "_")):
+                    vals.append(int(mm.group(0)))
+                    j = mm.end()
+                else:
+                    mm = HEADER_SUM.match(src, j)
+                    if mm is not None and isinstance(env.get(mm.group(1)), int) and isinstance(env.get(mm.group(2)), int):
+                        vals.append(env[mm.group(1)] + env[mm.group(2)])
+                        j = mm.end()
+                    else:
+                        ok = False
+                        break
+            k = j
+            while k < n and src[k] in " \t\r\n":
+                k += 1
+            if k < n and src[k] == ",":
+                j = k + 1
+                while j < n and src[j] in " \t\r\n":
+                    j += 1
+                continue
+            j = k
+            break
+        if not ok or len(vals) != len(names):
+            break
+        if not (src.startswith("local", j) or src.startswith("function", j) or j >= n or True):
+            break
+        for name, v in zip(names, vals):
+            env[name] = v
+            flat.append((name, v))
+        i = j
+    return env, flat, i
+
+
+def locate_headers(src):
+    out = []
+    for m in HEADER_START.finditer(src):
+        env, flat, end = read_header_chain(src, m.end())
+        if len(flat) >= 12 and any(isinstance(v, str) and len(v) >= 60 for _, v in flat):
+            out.append((m.start(), env, flat, end))
+    return out
+
+
+def alphabet_index(flat):
+    for idx, (_, v) in enumerate(flat):
+        if isinstance(v, str) and len(v) >= 60 and len(set(v)) == len(v):
+            return idx
+    return None
+
+
+def container_params(src):
+    for start, env, flat, end in locate_headers(src):
+        ai = alphabet_index(flat)
+        if ai is None or ai < 4 or ai + 1 >= len(flat):
+            continue
+        if not isinstance(flat[ai + 1][1], int) or not isinstance(flat[ai - 1][1], int) or not isinstance(flat[ai - 2][1], int):
+            continue
+        tail = src[end:end + 6000]
+        m = re.search(
+            r"local (\w+)=\((\w+)\+(\w+)\)%(\w+) local (\w+)=\((\w+)\+(\w+)\)%\4 "
+            r"local (\w+)=(\w+)%256 local (\w+)=(\w+)%256",
+            tail,
+        )
+        if m is None:
+            continue
+        g = m.groups()
+        try:
+            params = {
+                "v": env[g[1]],
+                "o": env[g[2]],
+                "k": env[g[5]],
+                "j": env[g[6]],
+                "y": env[g[8]],
+                "t": env[g[10]],
+            }
+        except KeyError:
+            continue
+        rotation = flat[ai - 2][1]
+        mconst = flat[ai - 1][1]
+        alphabet = flat[ai][1]
+        total = flat[ai + 1][1]
+        return params, rotation, mconst, alphabet, total
+    raise V2Error("container parameters not found")
+
+
 def load_container(src):
     chunks = parse_chunk_table(src)
     total_chk = 0
@@ -232,28 +358,7 @@ def load_container(src):
     for a, idx, data, chk in chunks:
         if a == real_tag:
             real[idx] = data
-    head = re.search(
-        r"=\(function\(\)local GS,wS,OS,VS=(\d+),(\d+),(\d+),(\d+) local sS=(\d+) local uS=(\d+) local oS=sS\+uS "
-        r"local HS=(\d+) local pS=(\d+) local JS=HS\+pS local QS=(\d+) local TS=(\d+) local YS=QS\+TS "
-        r"local nS=(\d+) local BS=(\d+) local tS=nS\+BS local vS,kS=(\d+),(\d+) local FS=(\d+) local mS=(\d+) "
-        r'local bS="([^"]+)"local zS=(\d+)',
-        src,
-    )
-    if head is None:
-        raise V2Error("container parameters not found")
-    g = head.groups()
-    params = {
-        "o": int(g[4]) + int(g[5]),
-        "j": int(g[6]) + int(g[7]),
-        "y": int(g[8]) + int(g[9]),
-        "t": int(g[10]) + int(g[11]),
-        "v": int(g[12]),
-        "k": int(g[13]),
-    }
-    rotation = int(g[14])
-    mconst = int(g[15])
-    alphabet = g[16]
-    total = int(g[17])
+    params, rotation, mconst, alphabet, total = container_params(src)
     parts = [real[i] for i in range(1, len(real) + 1)]
     raw = base_decode(parts, alphabet, total)
     dec = stream_decrypt(raw, params)
@@ -267,31 +372,75 @@ def load_container(src):
     if plen != len(payload):
         raise V2Error("container payload length mismatch")
     body = lz_decompress(payload, ulen) if mode == 1 else payload
-    if body is None or len(body) != ulen or crc16(body) != crc:
+    init, poly = crc_params(src)
+    if body is None or len(body) != ulen or crc16(body, init, poly) != crc:
         raise V2Error("container integrity check failed")
     records = parse_records(body, rotation)
     return records, mconst, total_chk
 
 
+def classify_ciphers_v2(tsrc):
+    mp = re.search(r"local (\w+)=\{((?:\[\d\]=\w+[,;])+\[\d\]=\w+)\}return function\((\w+)\)return \1\[\3\]or (\w+) end", tsrc)
+    if mp is None:
+        raise V2Error("cipher table not found")
+    head = tsrc[:mp.start()]
+    decl = list(re.finditer(r"local function (\w+)\((\w+),(\w+),(\w+)\)", head))
+    funcs = {}
+    for idx, m in enumerate(decl):
+        if m.group(1) in funcs:
+            continue
+        stop = decl[idx + 1].start() if idx + 1 < len(decl) else len(head)
+        funcs[m.group(1)] = head[m.end():stop]
+    kinds = {}
+    for name, body in funcs.items():
+        if re.search(r"%2(?!\d)", body):
+            kinds[name] = "rot"
+        elif re.search(r"=\(\(\w+\+\w+\)\+\w+\)%256", body):
+            kinds[name] = "state"
+        else:
+            ks = re.search(r"local (\w+)=\(\(\(\w+\+\w+\)\+\w+\)\+\w+\*\w+\)%256", body)
+            res = re.search(r"\w+\[\w+\]=\((\w+)-(\w+)\)%256", body)
+            if ks and res:
+                kinds[name] = "rev" if res.group(1) == ks.group(1) else "sub"
+    table = {}
+    for item in re.finditer(r"\[(\d)\]=(\w+)", mp.group(2)):
+        table[int(item.group(1))] = kinds.get(item.group(2), "sub")
+    return table, kinds.get(mp.group(4), "sub")
+
+
 class StringParams:
     def __init__(self, src):
-        m = re.search(
-            r"=\(function\(\)local GS,wS,OS,VS=(\d+),(\d+),(\d+),(\d+) local sS,uS=(\d+),(\d+) local oS=(\d+) "
-            r"local HS,pS,JS,QS,TS=(\d+),(\d+),(\d+),(\d+),(\d+) local YS=(\d+) local nS=(\d+) local BS=(\d+) "
-            r'local tS=(\d+) local vS="([^"]+)"local kS=(\d+) local FS=(\d+) local mS=(\d+)',
-            src,
-        )
-        if m is None:
+        found = None
+        block_start = 0
+        for start, env, flat, end in locate_headers(src):
+            ai = alphabet_index(flat)
+            if ai == 16 and len(flat) > 17 and isinstance(flat[17][1], int) and all(isinstance(flat[k][1], int) for k in range(16)):
+                found = flat
+                block_start = start
+                break
+        if found is None:
             raise V2Error("string cipher parameters not found")
-        g = m.groups()
-        self.ut, self.tt, self.qt, self.ot = (int(x) for x in g[0:4])
-        self.zt, self.gt = int(g[4]), int(g[5])
-        self.kinds = {1: int(g[7]), 2: int(g[8]), 3: int(g[9]), 4: int(g[10]), 5: int(g[11])}
-        self.state_base = int(g[12])
-        self.state_mult = int(g[13])
-        self.lt = int(g[15])
+        self.cipher_map = {1: "state", 2: "rev", 3: "sub", 4: "rot"}
+        self.cipher_default = "sub"
+        try:
+            from .container import group_end
+
+            block_end = group_end(src, block_start + 1)
+            table, default = classify_ciphers_v2(src[block_start:block_end])
+            if table:
+                self.cipher_map = table
+                self.cipher_default = default
+        except (AttributeError, ValueError, IndexError, KeyError, V2Error):
+            pass
+        g = [v for _, v in found]
+        self.ut, self.tt, self.qt, self.ot = g[0:4]
+        self.zt, self.gt = g[4], g[5]
+        self.kinds = {1: g[7], 2: g[8], 3: g[9], 4: g[10], 5: g[11]}
+        self.state_base = g[12]
+        self.state_mult = g[13]
+        self.lt = g[15]
         self.alphabet = g[16]
-        self.mod = int(g[17])
+        self.mod = g[17]
         last = {}
         for i, c in enumerate(self.alphabet):
             last[c] = i
@@ -302,6 +451,7 @@ class StringParams:
 
 
 def cipher_bytes(kind, data, a, b, p):
+    name = p.cipher_map.get(kind, p.cipher_default)
     wt = p.qt % 256
     dt = p.ot % 256
     mod = p.mod
@@ -317,13 +467,13 @@ def cipher_bytes(kind, data, a, b, p):
         u = (u * p.ma) % mod
         t = (t * p.mb) % mod
         z = (u + t + wt + dt * i) % 256
-        if kind == 1:
+        if name == "state":
             x = (c - z - q) % 256
             out.append(x)
             q = (q + c + x + i) % 256
-        elif kind == 2:
+        elif name == "rev":
             out.append((z - c) % 256)
-        elif kind == 4:
+        elif name == "rot":
             g = (c - z) % 256
             x = g % 2
             out.append((g - x) // 2 + x * 128)
@@ -463,7 +613,9 @@ class Analysis2:
 
 
 NOISE_RE = re.compile(r"if (\w+) and \1\(\)then\(nil\)\(\)end")
-DECODE_CALL_RE = re.compile(r'\w+\[18\]\(("(?:[^"\\]|\\.)*"),(\d+),(\d+),(\d+),(\d+)\)')
+DECODE_CALL_RE = re.compile(
+    r'\w+\[\d+\]\(("(?:[^"\\]|\\.)*"),([1-5]),(\d+),(\d+),(\d+)(?:,\d+)?(?:,\w+\[\d+\],\w+\[\d+\])?\)'
+)
 SUCCESSOR_RE = re.compile(r"(\d+)-(\w+)\[3\]")
 
 

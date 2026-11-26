@@ -28,8 +28,11 @@ def run_static_v2(args, src):
     try:
         an = Analysis2(src)
     except V2Error as ex:
-        sys.stderr.write("error: unsupported protector v2 container (%s)\n" % (ex,))
-        return 1
+        if args.raw:
+            sys.stderr.write("error: unsupported protector v2 container (%s)\n" % (ex,))
+            return 1
+        sys.stderr.write("note: static container analysis failed (%s), switching to emulation\n" % (ex,))
+        return run_emulation(args, src)
     if args.raw:
         text = render_blocks(an)
         res = None
@@ -37,8 +40,8 @@ def run_static_v2(args, src):
         try:
             res = static_run(src, assume=args.assume, strict=args.strict_env, step_limit=args.step_limit)
         except V2Error as ex:
-            sys.stderr.write("error: unsupported protector v2 layout (%s)\n" % (ex,))
-            return 1
+            sys.stderr.write("note: static VM layout not recognised (%s), switching to emulation\n" % (ex,))
+            return run_emulation(args, src)
         text = res.text
     if args.output:
         with open(args.output, "w", encoding="latin-1") as fh:
