@@ -1,4 +1,5 @@
 import argparse
+import re
 import sys
 from .analysis import Analysis
 from .emitter import Emitter, collect_strings, q
@@ -6,6 +7,97 @@ from .decompile import Decompiler, Observer
 from .evaluator import DEFAULT_ASSUMED, Evaluator
 from .render import render_residual, rv
 from .values import Bi, Clo, Obj, Sym
+
+BANNER_VERSION = re.compile(r"\bv\.\s*(\d+)\.(\d+)\.(\d+)")
+
+
+def detect_version(src):
+    m = None
+    for m in BANNER_VERSION.finditer(src[-4000:]):
+        pass
+    if m is None:
+        return None
+    return tuple(int(x) for x in m.groups())
+
+
+def run_static_v2(args, src):
+    from .v2 import V2Error, Analysis2, decoded_strings, render_blocks
+    from .v2host import static_run
+    from .emulate import quote
+
+    try:
+        an = Analysis2(src)
+    except V2Error as ex:
+        sys.stderr.write("error: unsupported protector v2 container (%s)\n" % (ex,))
+        return 1
+    if args.raw:
+        text = render_blocks(an)
+        res = None
+    else:
+        try:
+            res = static_run(src, assume=args.assume, strict=args.strict_env, step_limit=args.step_limit)
+        except V2Error as ex:
+            sys.stderr.write("error: unsupported protector v2 layout (%s)\n" % (ex,))
+            return 1
+        text = res.text
+    if args.output:
+        with open(args.output, "w", encoding="latin-1") as fh:
+            fh.write(text)
+    else:
+        sys.stdout.write(text)
+    if args.report:
+        sys.stderr.write("protector version: %s\n" % ".".join(str(x) for x in an.version))
+        sys.stderr.write("state records: %d, blocks: %d, entry state: %s\n" % (len(an.records), an.block_count(), an.entry_state()))
+        sys.stderr.write("container integrity: checksums, CRC and record stream verified\n")
+        if res is not None:
+            if res.limit_hit:
+                status = "stopped: step limit reached"
+            elif res.error is not None:
+                status = "stopped by a VM error: %s" % (res.error,)
+            else:
+                status = "VM program evaluated to completion"
+            sys.stderr.write("status: %s\n" % status)
+            sys.stderr.write("recorded statements: %d\n" % len(res.lines))
+    if args.strings:
+        for bi, mode, val in decoded_strings(an):
+            if isinstance(val, str):
+                sys.stderr.write("block %d mode %d %s\n" % (bi, mode, quote(val)))
+            else:
+                sys.stderr.write("block %d mode %d %r\n" % (bi, mode, val))
+    if res is not None and (res.limit_hit or res.error is not None):
+        return 2
+    return 0
+
+
+def run_emulation(args, src):
+    from .emulate import emulate
+
+    try:
+        res = emulate(src, assume=args.assume, strict=args.strict_env, step_limit=args.step_limit)
+    except SyntaxError as ex:
+        sys.stderr.write("error: the script could not be parsed (%s)\n" % (ex,))
+        return 1
+    if args.output:
+        with open(args.output, "w", encoding="latin-1") as fh:
+            fh.write(res.text)
+    else:
+        sys.stdout.write(res.text)
+    if args.report:
+        version = detect_version(src)
+        if version is not None:
+            sys.stderr.write("protector version: %d.%d.%d\n" % version)
+        if res.limit_hit:
+            status = "emulation stopped: step limit reached"
+        elif res.error is not None:
+            status = "emulation stopped by a script error: %s" % (res.error,)
+        else:
+            status = "emulated to completion"
+        sys.stderr.write("status: %s\n" % status)
+        sys.stderr.write("recorded statements: %d\n" % len(res.lines))
+        sys.stderr.write("loadstring layers: %d\n" % len(res.loaded))
+    if res.limit_hit or res.error is not None:
+        return 2
+    return 0
 
 
 class Unsupported(Exception):
@@ -73,7 +165,9 @@ def build_ast(an, ev, result):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Firefly static deobfuscator (no script execution)")
+    ap = argparse.ArgumentParser(
+        description="Firefly deobfuscator: static by default, --emulate runs the script in a sandboxed interpreter"
+    )
     ap.add_argument("input")
     ap.add_argument("-o", "--output")
     ap.add_argument("--strings", action="store_true")
@@ -83,9 +177,16 @@ def main(argv=None):
     ap.add_argument("--ast-all", action="store_true")
     ap.add_argument("--assume", action="append", default=[], metavar="NAME")
     ap.add_argument("--strict-env", action="store_true")
+    ap.add_argument("--emulate", action="store_true")
+    ap.add_argument("--step-limit", type=int, default=50000000)
     args = ap.parse_args(argv)
     with open(args.input, "r", encoding="latin-1") as fh:
         src = fh.read()
+    if args.emulate:
+        return run_emulation(args, src)
+    version = detect_version(src)
+    if version is not None and version[0] >= 2:
+        return run_static_v2(args, src)
     try:
         an = Analysis(src)
     except (ValueError, KeyError, IndexError, AttributeError, SyntaxError, TypeError) as ex:
